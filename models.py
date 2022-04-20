@@ -1,8 +1,6 @@
 import imp
 import logging
 import os
-from re import S
-from turtle import forward
 import json
 import torch
 import torch.nn as nn
@@ -173,7 +171,10 @@ class TransformerModelWrapper(nn.Module):
             cache_dir=config.cache_dir if config.cache_dir else None,
             )
         
-        self.model = ModelForPrompt(config, TransformersModel)
+        model = ModelForPrompt(config, TransformersModel)
+        if len(config.cuda_list) > 1:
+            model = nn.DataParallel(model, config.cuda_list)
+        self.model = model
         '''
         self.task_helper = load_task_helper(config.task_name, self)
         self.label_map = {label: i for i,
@@ -209,7 +210,7 @@ class TransformerModelWrapper(nn.Module):
                 label = batch['labels']
                 #batch['output_hidden_states'] = True
                 #idx = batch['idx']
-                model = self.model.model.module if hasattr(
+                model = self.model.module.model if hasattr(
                     self.model, 'module') else self.model.model 
                 mask_pos = (input_ids == mask_ids).long().argmax(dim=-1)
                 if is_posExam == True: #generate positive examples, replace <mask> with hard lebel word
@@ -257,9 +258,9 @@ class TransformerModelWrapper(nn.Module):
                 cl_emb[i][label] = pos_emb[pos_idx] #pos emb
             inputs['cl_examples'] = cl_emb
         
-        if self.config.no_cuda == False:
-            inputs = {k: t.cuda() if hasattr(t, 'cuda') else t
-             for k, t in inputs.items()}
+        #if self.config.no_cuda == False: to be fix
+        device = model.model.device
+        inputs = {k: t.to(device) for k, t in inputs.items()}
 
         return inputs
 
@@ -305,8 +306,10 @@ class TransformerModelWrapper(nn.Module):
         #to be fix, add train_acc
 
 
-    def eval(self, dataset:Dataset, metrics:List[str]=['acc']):
-        eval_dataloader = DataLoader(dataset, self.config.train_batch_size * 2)
+    def eval(self, dataset:Dataset, metrics:List[str]=['acc'], async_test=False):
+        eval_batch_size = self.config.async_batch_size \
+                        if async_test else self.config.train_batch_size * 2
+        eval_dataloader = DataLoader(dataset, eval_batch_size)
         total_batch = len(eval_dataloader)
         self.model.eval()
         preds = None
@@ -395,26 +398,33 @@ class TransformerModelWrapper(nn.Module):
 
     # 1. save eval/test results in text file; 
     # 2. for debugging or special experiments
-    def _save_config_and_results(self, path, results):
+    def _save_config(self, path):
         conf = json.dumps(self.config.__dict__, indent=3)
         with open(os.path.join(path, 'config.json'), 'w') as f:
             f.write(conf)
+
+    def save_result(self, path, results, iter, is_test=False):
         results_dict = results['metrics']
+        results_dict['iter'] = iter
+        results_dict['loss'] = results['eval_loss'].item()
         resl = json.dumps(results_dict, indent=3)
-        with open(os.path.join(path, 'results.json'), 'w') as f:
+        option = 'test_' if is_test else 'eval_'
+        with open(os.path.join(path, option+'results.json'), 'w') as f:
             f.write(resl)
 
-    def save(self, path, results):
+    def save(self, path, results, iter):
         logger.info("Saving trained model at %s..." % path)
         if self.config.debug:
             return        
         model_to_save = self.model.module if hasattr(
             self.model, 'module') else self.model     
-
+        #to be fix
         model_to_save.model.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
         if self.config.save_result:
-            self._save_config_and_results(path, results)    #to be fix
+            self.save_result(path, results, iter) 
+            if iter == 0:
+                self._save_config(path)
 
         embed_state = {
             "word_embeddings": model_to_save.model.get_input_embeddings().state_dict()            

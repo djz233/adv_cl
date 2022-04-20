@@ -1,4 +1,5 @@
 import argparse
+from email.policy import default
 import logging
 import os
 from typing import List
@@ -20,7 +21,9 @@ parser = argparse.ArgumentParser(
 
 #running args
 parser.add_argument("--task_name", type=str, default="imdb", help="task name")
+#to be fix, maybe not useful
 parser.add_argument("--cuda_list", type=list, default=[0], nargs='+',  help="list all cuda for training")
+parser.add_argument("--main_cuda", type=str, default='cuda:0')
 parser.add_argument("--metrics", type=List[str], help="metrics for task, best model is decided by the 1st metrics")
 parser.add_argument("--output_dir", type=str, default="model")
 parser.add_argument("--cache_dir", type=str, default="cache")
@@ -37,16 +40,19 @@ parser.add_argument("--option", type=str, default="train", choices=["train", "te
 parser.add_argument("--do_predict", action="store_true", help="whether to test on full dataset when evaluating")
 parser.add_argument("--sbert_model", type=str, default="roberta-large", help="pretrained model for sbert")
 parser.add_argument("--debug", action="store_true")
+parser.add_argument("--async_test", action="store_true")
+parser.add_argument("--async_cuda", type=str, default="cuda:1", help="cuda for test asynchronously, should be different from main_cuda")
+parser.add_argument("--async_batch_size", type=int, default=32, help="batch size for test asynchronously")
 
 #training args
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--train_stage", type=int, default=3, help="training stage")
 parser.add_argument("--train_batch_size", type=int, default=4)
-parser.add_argument("--num_train_epochs", type=int, default=160, help="total training epochs")
+parser.add_argument("--num_train_epochs", type=int, default=128, help="total training epochs")
 parser.add_argument("--grad_accu", type=int, default=1, help="gradient accumulate steps")
 parser.add_argument("--warmup_rate", type=float, default=0.0, help="warmup step percent")
 parser.add_argument("--num_logging_epochs", type=int, default=10, help="log training state every X epochs")
-parser.add_argument("--num_eval_epochs", type=int, default=20, help="evaluate every X epochs when training")
+parser.add_argument("--num_eval_epochs", type=int, default=16, help="evaluate every X epochs when training")
 parser.add_argument("--alpha", type=float, default=0.1, help="weight for MLM loss when combining losses")
 parser.add_argument("--max_grad_norm", type=float, default=1.0, help="gradient clipping")
 parser.add_argument("--use_cl_exmp", type=bool, default=False, help="whether to use contrastive examples")
@@ -70,6 +76,8 @@ if __name__ == "__main__":
     set_seed(config.seed)
     set_config_for_task(config)
     model = TransformerModelWrapper(config)
+    if config.no_cuda:
+        os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
     
 
     data_dir = os.path.join(config.data_dir, "k-shot", config.task_name, "{}-{}".format(config.num_k, config.seed, ))
