@@ -39,6 +39,10 @@ def get_sentence(task, line):
             raise NotImplementedError
     elif task in ['IMDB']:
         return line[0]
+    elif task in ['ag_news']:
+        return line[1] + ':' + line[2]
+    elif task in ['dbpedia','yahoo']:
+        return line[1]
         #import pdb; pdb.set_trace()
 
 def split_header(task, lines):
@@ -65,11 +69,11 @@ def load_datasets(data_dir, task, do_test=False):
         if do_test:
             splits.append('test')
     for split in splits:
-        if task in ['mr', 'sst-5', 'subj', 'trec', 'cr', 'mpqa', 'IMDB']:
+        if task in ['mr', 'sst-5', 'subj', 'trec', 'cr', 'mpqa', 'IMDB','ag_news','dbpedia','yahoo']:
             filename = os.path.join(data_dir, f"{split}.csv")
             #import pdb; pdb.set_trace()
             dataset[split] = pd.read_csv(filename, header=None).values.tolist()
-            if task in ['IMDB']:
+            if task in ['IMDB','ag_news','dbpedia','yahoo']:
                 dataset[split] = dataset[split][1:]
         
         else:
