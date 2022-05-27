@@ -2,6 +2,7 @@ import imp
 import logging
 import os
 import json
+from random import randint
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -55,18 +56,18 @@ class ModelForPrompt(nn.Module):
         B, L, hid_dim = mlm_labels.shape[0], mlm_labels.shape[1], self.model.config.hidden_size
         outputs = self.model(input_ids, attention_mask=attention_mask, labels=mlm_labels, output_hidden_states=True)
         MLM_loss, pred_scores, hidden_states = outputs[0], outputs[1], outputs[2]
-        total_loss = MLM_loss
+        
         if cl_examples is not None:
             mask_pos = (mlm_labels != -100).unsqueeze(dim=-1).expand(B, L, hid_dim) #(bsz, L, dim)
             last_hidden_states = hidden_states[-1]
             mask_rep = last_hidden_states[mlm_labels != -100] #(bsz, dim)
-            loss = self.cl_loss(mask_rep, cl_examples, labels)
-            total_loss = self.config.alpha * loss + MLM_loss
+            cl_loss = self.cl_loss(mask_rep, cl_examples, labels)
+            return MLM_loss, pred_scores, hidden_states, cl_loss
         
-        return total_loss, pred_scores, hidden_states
+        return MLM_loss, pred_scores, hidden_states
         
 class LabelEncoder(object):
-    def __init__(self, tokenizer, num_label:int, label_ids:dict):
+    def __init__(self, tokenizer, num_label:int, label_words:list):
         # Record prompt tokens
         pattern_token_set, pattern_token_indices = set(), []
         # RoBERTa tokenizer is initiated from GPT2Tokenizer,
@@ -78,15 +79,15 @@ class LabelEncoder(object):
             tokenizer, GPT2Tokenizer) else {}
         # Record label tokens
         label_token_ids = []
-        '''
-        for verbalizers, label_idx, in label_ids.items(): #["entailment", "not_entailment"]
+        for one_label_words in label_words: #["entailment", "not_entailment"]
             one_label_token_ids = []
-            for verbalizer_idx, verbalizer in enumerate(verbalizers):
+            for verbalizer_idx, verbalizer in enumerate(one_label_words):
                 verbalizer_id = tokenizer.convert_tokens_to_ids(verbalizer)
                 assert verbalizer_id != tokenizer.unk_token_id, "verbalization was tokenized as <UNK>, verbalizer:{}".format(verbalizer)
                 one_label_token_ids.append(verbalizer_id)
             label_token_ids.append(one_label_token_ids)
-        '''
+        
+        self.label_token_ids = label_token_ids
 
         assert len(pattern_token_set) < 50 and len(label_token_ids) < 49
         #print("prompt encoder")
@@ -111,11 +112,15 @@ class LabelEncoder(object):
 
     def init_embed(self, model, random_=False):
         w = model.get_input_embeddings().weight.data
-        for origin_id, convert_id in self.label_convert.items():
+        for class_id, convert_id in self.label_convert.items():
             if random_:
                 max_val = w[convert_id].abs().max()
                 w[convert_id].uniform_(-max_val, max_val)
             else:
+                try:
+                    origin_id = self.label_token_ids[class_id][0]
+                except:
+                    import pdb; pdb.set_trace()
                 w[convert_id] = w[origin_id] #to be fix
 
 
@@ -172,8 +177,7 @@ class TransformerModelWrapper(nn.Module):
             )
         
         model = ModelForPrompt(config, TransformersModel)
-        if len(config.cuda_list) > 1:
-            model = nn.DataParallel(model, config.cuda_list)
+
         self.model = model
         '''
         self.task_helper = load_task_helper(config.task_name, self)
@@ -182,10 +186,12 @@ class TransformerModelWrapper(nn.Module):
         '''
 
         self.encoder = LabelEncoder(
-            self.tokenizer, config.num_label,  config.label_words)#to be fix: too much param
-        # Random init prompt tokens HERE!
-        self.encoder.init_embed(self.model.model, random_=False)
+            self.tokenizer, config.num_label,  config.label_words)
 
+        self.encoder.init_embed(self.model.model)
+
+        #if len(config.cuda_list) > 1:
+        #    self.model = nn.DataParallel(self.model, config.cuda_list)
         '''
         if config.device == 'cuda':
             if torch.cuda.device_count() > 1:
@@ -198,7 +204,8 @@ class TransformerModelWrapper(nn.Module):
     def _generate_contrastive_embedding(self, inputs: torch.Tensor, epoch: int, dataset, is_posExam:bool=True) -> torch.Tensor:
         #generate all positive CL embedding for the epoch
         L = len(self.hard_label[0])
-        hard_label = [label[epoch % L] for label in self.hard_label]
+        idx = randint(0, L-1)
+        hard_label = [label[idx] for label in self.hard_label]
         mask_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
         pos_embedding = []
               
@@ -210,17 +217,18 @@ class TransformerModelWrapper(nn.Module):
                 label = batch['labels']
                 #batch['output_hidden_states'] = True
                 #idx = batch['idx']
-                model = self.model.module.model if hasattr(
-                    self.model, 'module') else self.model.model 
+                model = self.model.module if hasattr(
+                    self.model, 'module') else self.model 
                 mask_pos = (input_ids == mask_ids).long().argmax(dim=-1)
                 if is_posExam == True: #generate positive examples, replace <mask> with hard lebel word
                     batch['input_ids'][0][mask_pos] = self.tokenizer.convert_tokens_to_ids(hard_label[label])  
+                device = model.model.device
                 inputs = {
-                    'input_ids': input_ids.to(model.device),
-                    'attention_mask': batch['attention_mask'].to(model.device),
+                    'input_ids': input_ids.to(device),
+                    'attention_mask': batch['attention_mask'].to(device),
                     'output_hidden_states': True,
                 }
-                outputs = model(**inputs)
+                outputs = model.model(**inputs)
                 pos_CLemb = outputs[-1][-1][0][mask_pos].squeeze(dim=0)
                 pos_embedding.append(pos_CLemb)
         return torch.stack(pos_embedding, dim=0).detach()               
@@ -252,10 +260,11 @@ class TransformerModelWrapper(nn.Module):
             cl_emb = torch.rand((B, self.config.num_label, dim_emb))
             for i, idx in enumerate(batch['idx']):
                 i_th_sampled = sample_idx[idx]
-                cl_emb[i] = torch.index_select(neg_emb.cpu(), dim=0, index=i_th_sampled) #neg emb to be fix, 第一次？
+                cl_emb[i] = torch.index_select(neg_emb.cpu(), dim=0, index=i_th_sampled) 
                 label = batch['labels'][i]
+                # maybe a problem
                 pos_idx = i_th_sampled[label]
-                cl_emb[i][label] = pos_emb[pos_idx] #pos emb
+                cl_emb[i][label] = pos_emb[pos_idx] #pos emb: sample or not? 
             inputs['cl_examples'] = cl_emb
         
         #if self.config.no_cuda == False: to be fix
@@ -270,20 +279,23 @@ class TransformerModelWrapper(nn.Module):
         pos_emb, neg_emb = None, None
         cl_exmp_idx = None
         #choose cl examples index for generating cl example
-        if self.config.use_cl_exmp == True:
+        if self.config.use_cl_exmp == True and exmp_sim_score is not None:
             N = exmp_sim_score.shape[-1]
             perm = torch.randperm(N)
             cl_exmp_idx = exmp_sim_score[:,:, perm[0]]
             pos_emb = self._generate_contrastive_embedding(None, epoch, dataset)
             #For epoch 0, negative examples shoule be generated
-            neg_emb = self.model.cl_neg_embedding if epoch else self._generate_contrastive_embedding(None, epoch, dataset, False)
+            model = self.model.module if hasattr(
+                self.model, 'module') else self.model            
+            neg_emb = model.cl_neg_embedding if epoch else self._generate_contrastive_embedding(None, epoch, dataset, False)
 
         global_step = 0
         train_loss = 0.0 #sum format
-        train_dataloader = DataLoader(dataset, self.config.train_batch_size, shuffle=True)
+        train_dataloader = DataLoader(dataset, batch_size=self.config.train_batch_size, shuffle=True)
         total_batch = len(train_dataloader)
         self.model.train()
         for i, batch in enumerate(train_dataloader):
+            #import pdb; pdb.set_trace()
             output = self.mlm_train_step(batch, pos_emb=pos_emb, 
                                 neg_emb=neg_emb, sample_idx=cl_exmp_idx)
             loss = output
@@ -302,13 +314,13 @@ class TransformerModelWrapper(nn.Module):
                 if scheduler is not None:   scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
-        return global_step, train_loss / total_batch, 
+        return global_step, train_loss / len(dataset), 
         #to be fix, add train_acc
 
 
     def eval(self, dataset:Dataset, metrics:List[str]=['acc'], async_test=False):
         eval_batch_size = self.config.async_batch_size \
-                        if async_test else self.config.train_batch_size * 2
+                        if async_test else self.config.test_batch_size 
         eval_dataloader = DataLoader(dataset, eval_batch_size)
         total_batch = len(eval_dataloader)
         self.model.eval()
@@ -353,11 +365,11 @@ class TransformerModelWrapper(nn.Module):
 
         evaluate_results = {}
         for one_metrics in metrics:
-            result = compute_metrics(preds.argmax(-1), out_label_ids, one_metrics) #to be fix
+            result = compute_metrics(preds.argmax(-1), out_label_ids, one_metrics) 
             evaluate_results[one_metrics] = result
 
         results = {
-            "eval_loss": eval_loss / total_batch,
+            "eval_loss": eval_loss / len(dataset),
             'metrics': evaluate_results,
             'indices': all_indices,
             'logits': preds,
@@ -371,26 +383,38 @@ class TransformerModelWrapper(nn.Module):
 
     def mlm_train_step(self, batch: Dict[str, torch.Tensor], pos_emb:torch.Tensor = None, neg_emb:torch.Tensor = None, sample_idx:torch.Tensor = None) -> torch.Tensor:
         inputs = self._generate_default_inputs(batch, pos_emb, neg_emb, sample_idx)   
-        model = self.model.module if hasattr(
-            self.model, 'module') else self.model
-        outputs = model(**inputs)
+
+        outputs = self.model(**inputs)
         loss, pred_scores, hidden_states = outputs[0], outputs[1], outputs[2]
+        if self.config.ce_loss:
+            ce_logits = self.encoder.convert_mlm_logits_to_cls_logits(inputs['mlm_labels'], pred_scores)
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(ce_logits, inputs['labels'])
+        if pos_emb is not None:
+            
+            cl_loss = outputs[-1]
+            loss += self.config.alpha * cl_loss.mean() #mean() for data parallel        
         if self.config.use_cl_exmp == True:
+            model = self.model.module if hasattr(
+                self.model, 'module') else self.model            
             last_layer_rep = hidden_states[-1]
             mask_reps = last_layer_rep[inputs['mlm_labels'] != -100]
             for idx, mask_rep in zip(batch['idx'], mask_reps):
-                self.model.cl_neg_embedding[idx] = mask_rep.detach()
+                model.cl_neg_embedding[idx] = mask_rep.detach()
         return loss
         #to be fix, add train_acc
 
     def mlm_eval_step(self, batch: Dict[str, torch.Tensor]):
         inputs = self._generate_default_inputs(batch)
-        model = self.model.module if hasattr(
-            self.model, 'module') else self.model   
-        outputs = model(**inputs)
+        #model = self.model.module if hasattr(
+        #    self.model, 'module') else self.model   
+        outputs = self.model(**inputs)
         loss, pred_scores, hidden_states = outputs[0], outputs[1], outputs[2]
 
         ce_logits = self.encoder.convert_mlm_logits_to_cls_logits(inputs['mlm_labels'], pred_scores)
+        if self.config.ce_loss:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(ce_logits, inputs['labels'])            
         masked_full_logits = pred_scores[inputs['mlm_labels'] >= 0]
         masked_hidden_states = hidden_states[-1][inputs['mlm_labels'] >= 0]
 
